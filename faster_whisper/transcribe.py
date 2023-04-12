@@ -3,11 +3,14 @@ import logging
 import os
 import zlib
 
-from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    BinaryIO, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union,
+)
 
 import ctranslate2
 import numpy as np
 import tokenizers
+import torch
 
 from faster_whisper.audio import decode_audio
 from faster_whisper.feature_extractor import FeatureExtractor
@@ -320,6 +323,183 @@ class WhisperModel:
 
         return segments, audio_info
 
+    def batch_transcribe(
+        self,
+        audio: Union[List[str], List[BinaryIO], List[np.ndarray]],
+        language: Optional[List[str]] = None,
+        task: str = "transcribe",
+        beam_size: int = 5,
+        best_of: int = 5,
+        patience: float = 1,
+        length_penalty: float = 1,
+        temperature: Union[float, List[float], Tuple[float, ...]] = [
+            0.0,
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0,
+        ],
+        compression_ratio_threshold: Optional[float] = 2.4,
+        log_prob_threshold: Optional[float] = -1.0,
+        no_speech_threshold: Optional[float] = 0.6,
+        condition_on_previous_text: bool = True,
+        initial_prompt: Optional[List[str]] = None,
+        prefix: Optional[List[str]] = None,
+        suppress_blank: bool = True,
+        suppress_tokens: Optional[List[int]] = [-1],
+        without_timestamps: bool = False,
+        max_initial_timestamp: float = 1.0,
+        word_timestamps: bool = False,
+        prepend_punctuations: str = "\"'“¿([{-",
+        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        vad_filter: bool = False,
+        vad_parameters: Optional[dict] = None,
+    ) -> List[Tuple[Iterable[Segment], AudioInfo]]:
+        """Transcribe a batch of audio files.
+
+        Arguments:
+            audio: A list of audio files, each one can be a path to a file, a file object or a NumPy array.
+            language: A list of languages, one for each audio file. It should be a language code such
+                as "en" or "fr". If not set, the language will be detected in the first 30 seconds
+                of audio.
+            task: The task to perform, either "transcribe" or "translate".
+            beam_size: The beam size to use for decoding.
+            best_of: The number of best hypotheses to return.
+            patience: Beam search patience factor.
+            length_penalty: Exponential length penalty constant.
+            temperature: Temperature for sampling. It can be a tuple of temperatures,
+                which will be successively used upon failures according to either
+                `compression_ratio_threshold` or `log_prob_threshold`.
+                compression_ratio_threshold: If the gzip compression ratio is above this value,
+                treat as failed.
+            log_prob_threshold: If the average log probability over sampled tokens is
+                below this value, treat as failed.
+            no_speech_threshold: If the no_speech probability is higher than this value AND
+                the average log probability over sampled tokens is below `log_prob_threshold`,
+                consider the segment as silent.
+            condition_on_previous_text: If True, the previous output of the model is provided
+                as a prompt for the next window; disabling may make the text inconsistent across
+                windows, but the model becomes less prone to getting stuck in a failure loop,
+                such as repetition looping or timestamps going out of sync.
+            initial_prompt: A list of text prompts to provide as a prefix for the first window.
+            prefix: A list of text prompts to provide as a prefix for each window.
+            suppress_blank: Suppress blank outputs at the beginning of the sampling.
+            suppress_tokens: List of token IDs to suppress. -1 will suppress a default set
+                of symbols as defined in the model config.json file.
+            without_timestamps: Only sample text tokens.
+            max_initial_timestamp: The initial timestamp cannot be later than this.
+            word_timestamps: Extract word-level timestamps using the cross-attention pattern
+                and dynamic time warping, and include the timestamps for each word in each segment.
+            prepend_punctuations: If word_timestamps is True, merge these punctuation symbols
+                with the next word
+            append_punctuations: If word_timestamps is True, merge these punctuation symbols
+                with the previous word
+            vad_filter: Enable the voice activity detection (VAD) to filter out parts of the audio
+                without speech. This step is using the Silero VAD model
+                https://github.com/snakers4/silero-vad.
+            vad_parameters: Dictionary of Silero VAD parameters (see available parameters and
+                default values in the function `get_speech_timestamps`).
+
+        Returns:
+            A list of tuples, each containing:
+                - An iterable of segments.
+                - An audio info object.
+        """
+        sampling_rate: int = self.feature_extractor.sampling_rate
+
+        if not isinstance(audio, list):
+            raise TypeError("You must provide a list of audio files to use `batch_transcribe()`.")
+
+        audio: List[np.ndarray] = [decode_audio(a, sampling_rate) if not isinstance(a, np.ndarray) else a for a in audio]
+
+        durations: List[float] = [audio.shape[0] / sampling_rate for audio in audio]
+
+        self.logger.info(
+            "Processing %d audio file(s) of %s total duration.", len(audio), format_timestamp(sum(durations))
+        )
+
+        if vad_filter:
+            pass
+        else:
+            speech_chunks = [None] * len(audio)
+
+        features: List[np.ndarray] = [self.feature_extractor(a) for a in audio]
+
+        encoder_output = None
+
+        if language is None:
+            if not self.model.is_multilingual:
+                language = ["en" for _ in audio]
+                language_probabilities = [1.0 for _ in audio]
+            else:
+                # TODO: implement language detection for batch
+                pass
+        else:
+            language_probabilities = [1.0 for _ in audio]
+
+        tokenizers: Dict[str, Tokenizer] = {
+            lang: Tokenizer(
+                self.hf_tokenizer,
+                self.model.is_multilingual,
+                task=task,
+                language=lang,
+            )
+            for lang in set(language)
+        }
+
+        if initial_prompt is None:
+            initial_prompt = [None] * len(audio)
+        if prefix is None:
+            prefix = [None] * len(audio)
+
+        options: List[TranscriptionOptions] = [
+            TranscriptionOptions(
+                beam_size=beam_size,
+                best_of=best_of,
+                patience=patience,
+                length_penalty=length_penalty,
+                log_prob_threshold=log_prob_threshold,
+                no_speech_threshold=no_speech_threshold,
+                compression_ratio_threshold=compression_ratio_threshold,
+                condition_on_previous_text=condition_on_previous_text,
+                temperatures=(
+                    temperature if isinstance(temperature, (list, tuple)) else [temperature]
+                ),
+                initial_prompt=initial_prompt[i],
+                prefix=prefix[i],
+                suppress_blank=suppress_blank,
+                suppress_tokens=get_suppressed_tokens(tokenizers[lang], suppress_tokens),
+                without_timestamps=without_timestamps,
+                max_initial_timestamp=max_initial_timestamp,
+                word_timestamps=word_timestamps,
+                prepend_punctuations=prepend_punctuations,
+                append_punctuations=append_punctuations,
+            )
+            for i, lang in enumerate(language)
+        ]
+
+        segments: List[Segment] = self.generate_batch_segments(
+            features, tokenizers, language, options, encoder_output
+        )
+
+        segments: List[Segment] = [
+            restore_speech_timestamps(segment, speech_chunk, sampling_rate)
+            if speech_chunk is not None else segment
+            for segment, speech_chunk in zip(segments, speech_chunks)
+        ]
+
+        audio_info: List[AudioInfo] = [
+            AudioInfo(
+                language=language[i],
+                language_probability=language_probabilities[i],
+                duration=durations[i],
+            )
+            for i in range(len(audio))
+        ]
+
+        return list(zip(segments, audio_info))
+
     def generate_segments(
         self,
         features: np.ndarray,
@@ -515,6 +695,27 @@ class WhisperModel:
                     avg_log_prob=avg_log_prob,
                     no_speech_prob=result.no_speech_prob,
                 )
+
+    def generate_batch_segments(
+        self,
+        features: List[np.ndarray],
+        tokenizers: Dict[str, Tokenizer],
+        languages: List[str],
+        options: List[TranscriptionOptions],
+        encoder_outputs: Optional[ctranslate2.StorageView] = None,
+    ) -> List[Iterable[Segment]]:
+        content_frames = [feature.shape[-1] - self.feature_extractor.nb_max_frames for feature in features]
+        seekers = [0] * len(features)
+        all_tokens = [[] for _ in features]
+        all_segments = [[] for _ in features]
+        prompt_reset_since = [0] * len(features)
+
+        initial_prompts = []
+        for opt, lang in zip(options, languages):
+            if opt.initial_prompt is not None:
+                initial_prompts.append(tokenizers[lang].encode(" " + opt.initial_prompt.strip()))
+                all_tokens.extend(opt.initial_prompt)
+                
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
