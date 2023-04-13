@@ -715,7 +715,56 @@ class WhisperModel:
             if opt.initial_prompt is not None:
                 initial_prompts.append(tokenizers[lang].encode(" " + opt.initial_prompt.strip()))
                 all_tokens.extend(opt.initial_prompt)
-                
+
+        while self.check_cursors(seekers, content_frames):
+            continue_processing = [seeker < content_frame for seeker, content_frame in list(zip(seekers, content_frames))]
+            imap = [i for i, cont in enumerate(continue_processing) if cont]
+            batch_time_offsets = []
+            batch_segments = []
+            batch_segment_sizes = []
+            batch_segment_durations = []
+            for i, feat in enumerate(features):
+                if continue_processing[i]:
+                    batch_time_offsets.append(seekers[i] * self.feature_extractor.time_per_frame)
+                    batch_segments.append(feat[:, seekers[i] : seekers[i] + self.feature_extractor.nb_max_frames])
+                    batch_segment_sizes.append(min(self.feature_extractor.nb_max_frames, content_frames[i] - seekers[i]))
+                    batch_segment_durations.append(batch_segment_sizes[-1] * self.feature_extractor.time_per_frame)
+                else:
+                    continue
+
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "Processing batch of %d segments at %s",
+                    len(batch_segments),
+                    format_timestamp(sum(batch_time_offsets) / len(batch_segments)),
+                )
+
+            previous_tokens = [all_tokens[imap[i]][prompt_reset_since[imap[i]]:] for i in range(len(batch_segments))]
+            prompts = [
+                self.get_prompt(
+                    tokenizers[lang],
+                    previous_tokens[i],
+                    without_timestamps=options[i].without_timestamps,
+                    prefix=options[i].prefix if seekers[imap[i]] == 0 else None,
+                )
+                for i, lang in enumerate(languages)
+            ]
+
+            if encoder_outputs is None:
+                encoder_outputs = self.encode_batch(batch_segments)
+
+            results, avg_log_probs, temperatures = self.generate_batch_with_fallback(
+                encoder_outputs, prompts, tokenizers, options,
+            )
+
+            
+            
+
+
+
+    def check_cursors(self, seekers: List[int], content_frames: List[int]) -> bool:
+        """Check if all cursors are at the end of the content."""
+        return any([seeker < content_frame for seeker, content_frame in list(zip(seekers, content_frames))])
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
@@ -723,6 +772,15 @@ class WhisperModel:
         to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
 
         features = np.expand_dims(features, 0)
+        features = get_ctranslate2_storage(features)
+
+        return self.model.encode(features, to_cpu=to_cpu)
+
+    def encode_batch(self, features: List[np.ndarray]) -> ctranslate2.StorageView:
+        # When the model is running on multiple GPUs, the encoder output should be moved
+        # to the CPU since we don't know which GPU will handle the next job.
+        to_cpu = self.model.device == "cuda" and len(self.model.device_index) > 1
+
         features = get_ctranslate2_storage(features)
 
         return self.model.encode(features, to_cpu=to_cpu)
